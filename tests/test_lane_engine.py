@@ -16,12 +16,36 @@ import pytest
 from tensorfold.engine.lane_engine import (
     LaneEngine,
     LaneStream,
+    PrefillCancelled,
     SuffixLookupProposer,
     apply_round,
     plan_windows,
     verify_window,
 )
 from tests.lane_fakes import FakeEngine, PatternProposer, fake_serial
+
+
+def test_disconnected_client_stops_lane_prefill_before_next_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mlx.core as mx
+
+    engine = LaneEngine(object())
+    engine.lane_prefill = 2
+    monkeypatch.setattr(engine, "_resolve_stack", lambda: (None, None, None))
+    monkeypatch.setattr(engine, "_reserve_keys", lambda *_: None)
+    monkeypatch.setattr(engine, "_tree_commit", lambda: lambda *_: None)
+    disconnected = False
+    calls = 0
+
+    def forward(*_args: Any, **_kwargs: Any) -> tuple[Any, list[Any]]:
+        nonlocal disconnected, calls
+        calls += 1
+        disconnected = True
+        return mx.zeros((1, 1, 1)), []
+
+    monkeypatch.setattr(engine, "_tree_forward", lambda: forward)
+    with pytest.raises(PrefillCancelled):
+        engine._lane_prefill_tokens([1, 2, 3, 4, 5, 6], [], cancelled=lambda: disconnected)
+    assert calls == 1
 
 
 # --------------------------------------------------------------------------

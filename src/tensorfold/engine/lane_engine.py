@@ -36,6 +36,10 @@ from typing import Any, Callable, Sequence
 from tensorfold.engine.lane_family import FamilyRounds
 
 
+class PrefillCancelled(Exception):
+    """A client left while its prompt was being fed to the model."""
+
+
 # --------------------------------------------------------------------------
 # proposers
 # --------------------------------------------------------------------------
@@ -723,7 +727,7 @@ class LaneEngine(FamilyRounds):
             if not start < boundary < len(stream.prompt_ids):
                 continue
             head = stream.prompt_ids[start:boundary]
-            self._prefill_tokens(head, work)
+            self._prefill_tokens(head, work, cancelled=lambda: stream.finished)
             if taps_store and all(t is not None for t in taps_store):
                 carried = [t if carried is None else mx.concatenate([carried[i], t], axis=1)[:, -2048:]
                            for i, t in enumerate(taps_store)]
@@ -732,7 +736,7 @@ class LaneEngine(FamilyRounds):
             )
             start = boundary
         suffix = stream.prompt_ids[start:]
-        logits = self._prefill_tokens(suffix, work)
+        logits = self._prefill_tokens(suffix, work, cancelled=lambda: stream.finished)
         self._route_hidden(None)
         if carried is not None and taps_store and all(t is not None for t in taps_store):
             for i, tap in enumerate(taps_store):
@@ -789,7 +793,10 @@ class LaneEngine(FamilyRounds):
 
         lane_tree.HIDDEN_SINK = getattr(getattr(stream, "proposer", None), "sink", None)
 
-    def _prefill_tokens(self, tokens: Sequence[int], cache: list[Any]) -> Any:
+    def _prefill_tokens(
+        self, tokens: Sequence[int], cache: list[Any], *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Any:
         """Feed ``tokens`` into ``cache`` in chunks of ``prefill_step``; the last position's logits [1, 1, V].
 
         One forward over a long suffix materialises its attention scores whole when the
@@ -801,11 +808,13 @@ class LaneEngine(FamilyRounds):
         import mlx.core as mx
 
         if self.lane_prefill:
-            return self._lane_prefill_tokens(tokens, cache)
+            return self._lane_prefill_tokens(tokens, cache, cancelled=cancelled)
         _, core, head = self._resolve_stack()
         logits = None
         step = self._align() or max(1, int(self.prefill_step))
         for begin in range(0, len(tokens), step):
+            if cancelled is not None and cancelled():
+                raise PrefillCancelled
             chunk = [int(t) for t in tokens[begin:begin + step]]
             hidden = core(mx.array([chunk], dtype=mx.uint32), cache=cache)
             last = hidden[:, -1:, :]
@@ -815,7 +824,10 @@ class LaneEngine(FamilyRounds):
                 mx.clear_cache()
         return logits
 
-    def _lane_prefill_tokens(self, tokens: Sequence[int], cache: list[Any]) -> Any:
+    def _lane_prefill_tokens(
+        self, tokens: Sequence[int], cache: list[Any], *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Any:
         """The prompt through the decode path: chains of ``lane_prefill`` rows, each committed.
 
         Row-exact kernels make each row's bits independent of the chain it rides in, so the
@@ -834,6 +846,8 @@ class LaneEngine(FamilyRounds):
         logits = None
         end = start + len(tokens)
         for begin in range(0, len(tokens), width):
+            if cancelled is not None and cancelled():
+                raise PrefillCancelled
             chunk = [int(t) for t in tokens[begin:begin + width]]
             n = len(chunk)
             last = begin + width >= len(tokens)
@@ -994,9 +1008,15 @@ class LaneEngine(FamilyRounds):
         if self.family:
             self._family_add_stream(stream, cache=cache, cached_tokens=cached_tokens, checkpoints_at=checkpoints_at)
             return
-        cache = self.prefill(
-            stream, cache=cache, cached_tokens=cached_tokens, checkpoints_at=checkpoints_at
-        )
+        try:
+            cache = self.prefill(
+                stream, cache=cache, cached_tokens=cached_tokens, checkpoints_at=checkpoints_at
+            )
+        except PrefillCancelled:
+            self._route_hidden(None)
+            stream.finished = True
+            stream.finished_at = time.perf_counter()
+            return
         self.streams.append(stream)
         if stream.finished:
             stream.finished_at = time.perf_counter()
