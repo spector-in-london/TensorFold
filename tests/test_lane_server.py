@@ -21,6 +21,7 @@ from tensorfold.server.app import (
     render_prompt_ids,
 )
 from tests.lane_fakes import FakeEngine, fake_serial
+from tensorfold.server.http import ClientDisconnected
 
 EOS = 49
 
@@ -548,3 +549,79 @@ def test_scheduler_runs_its_stop_hook_in_its_own_thread() -> None:
     scheduler.start()
     scheduler.stop(timeout=5.0)
     assert seen == ["tensorfold-engine"]
+
+
+def test_disconnected_queued_request_does_not_start() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class GatedEngine(FakeEngine):
+        def _forward_rows(self, rows: list[list[int]], cache: list[Any]) -> tuple[Any, Any]:
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError("test gate was not released")
+            return super()._forward_rows(rows, cache)
+
+    app = make_app(lanes=1, engine_factory=GatedEngine)
+    first: dict[str, Any] = {}
+    dropped = threading.Event()
+    second: dict[str, Any] = {}
+
+    def first_call() -> None:
+        try:
+            first["reply"] = app.chat([{"role": "user", "content": "first"}], max_tokens=4)
+        except BaseException as exc:
+            first["error"] = exc
+
+    def second_call() -> None:
+        try:
+            app.chat([{"role": "user", "content": "abandoned"}], max_tokens=4,
+                     disconnected=dropped.is_set)
+        except BaseException as exc:
+            second["error"] = exc
+
+    first_thread = threading.Thread(target=first_call)
+    second_thread = threading.Thread(target=second_call)
+    try:
+        first_thread.start()
+        assert entered.wait(1)
+        second_thread.start()
+        deadline = time.monotonic() + 1
+        while app.scheduler._queue.qsize() < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert app.scheduler._queue.qsize() == 1
+        dropped.set()
+        second_thread.join(1)
+        assert not second_thread.is_alive()
+        assert isinstance(second.get("error"), ClientDisconnected)
+        release.set()
+        first_thread.join(2)
+        assert not first_thread.is_alive()
+        assert "reply" in first, first.get("error")
+        deadline = time.monotonic() + 1
+        while app.scheduler.completed < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert app.scheduler.starts == 1
+        assert app.chat([{"role": "user", "content": "next"}], max_tokens=4)["content"]
+    finally:
+        release.set()
+        first_thread.join(2) if first_thread.ident is not None else None
+        second_thread.join(2) if second_thread.ident is not None else None
+        app.close()
+
+
+def test_broken_stream_cancels_active_job() -> None:
+    app = make_app(lanes=1)
+    try:
+        def broken(_delta: str | dict[str, Any]) -> None:
+            raise BrokenPipeError("client closed its stream")
+
+        with pytest.raises(BrokenPipeError):
+            app.chat([{"role": "user", "content": "stream"}], max_tokens=12, on_delta=broken)
+        deadline = time.monotonic() + 1
+        while app.scheduler.active and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert app.scheduler.active == 0
+        assert app.chat([{"role": "user", "content": "next"}], max_tokens=4)["content"]
+    finally:
+        app.close()

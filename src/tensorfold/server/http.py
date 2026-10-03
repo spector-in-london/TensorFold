@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
+import socket
 import time
 import traceback
 import uuid
@@ -23,6 +25,23 @@ _REQUEST_LOG = os.environ.get("TENSORFOLD_REQUEST_LOG", "")
 
 class RequestError(ValueError):
     """A request the server refuses: answered with HTTP 400 (in a stream, an error event)."""
+
+
+class ClientDisconnected(ConnectionAbortedError):
+    """The client left before its queued or active inference could be delivered."""
+
+
+def peer_disconnected(connection: socket.socket) -> bool:
+    """Check for EOF without consuming a byte from a live HTTP client."""
+
+    try:
+        if not select.select([connection], [], [], 0)[0]:
+            return False
+        return not connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+    except (BlockingIOError, InterruptedError):
+        return False
+    except OSError:
+        return True
 
 
 def served_model_ids(served_name: str, aliases: list[str] | None = None) -> list[str]:
@@ -530,6 +549,10 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                     sampling_fields["enable_thinking"] = bool(template_kwargs["enable_thinking"])
                 sampling_kw = ({"sampling": sampling_fields}
                                if getattr(app, "accepts_sampling", False) else {})
+                disconnect_kw = (
+                    {"disconnected": lambda: peer_disconnected(self.connection)}
+                    if getattr(app, "accepts_disconnect", False) else {}
+                )
                 stream = bool(body.get("stream", False))
             except Exception as exc:
                 self._send_json({"error": {"message": str(exc)}}, status=400)
@@ -673,6 +696,7 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                                     tools=tools,
                                     **extra,
                                     **sampling_kw,
+                                    **disconnect_kw,
                                 )
                             )
                             tool_calls = reply.get("tool_calls")
@@ -692,9 +716,10 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                                 temperature=temperature,
                                 on_delta=on_delta,
                                 **sampling_kw,
+                                **disconnect_kw,
                             )
-                    except BrokenPipeError:
-                        raise
+                    except (BrokenPipeError, ConnectionResetError, ClientDisconnected):
+                        return
                     except RequestError as exc:
                         emit({"error": {"message": str(exc), "type": "invalid_request_error"}})
                         self.wfile.write(b"data: [DONE]\n\n")
@@ -726,6 +751,7 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                         temperature=temperature,
                         tools=tools or None,
                         **sampling_kw,
+                        **disconnect_kw,
                     )
                 )
                 if is_text_completion:
@@ -774,7 +800,7 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                         **response_extras(reply),
                     }
                 )
-            except BrokenPipeError:
+            except (BrokenPipeError, ConnectionResetError, ClientDisconnected):
                 pass
             except RequestError as exc:
                 self._send_json({"error": {"message": str(exc), "type": "invalid_request_error"}}, status=400)

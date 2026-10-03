@@ -1,10 +1,11 @@
 import http.client
 import json
+import socket
 import threading
 from http.server import ThreadingHTTPServer
 from typing import Any
 
-from tensorfold.server.http import make_handler
+from tensorfold.server.http import make_handler, peer_disconnected
 
 
 class FakeTokenizer:
@@ -293,3 +294,17 @@ def test_chat_completions_streams_tool_call_deltas() -> None:
     assert '"finish_reason": "tool_calls"' in body
     assert "<tool_call>" not in body
     assert "data: [DONE]" in body
+
+
+def test_peer_disconnect_detection_does_not_consume_live_data() -> None:
+    server, client = socket.socketpair()
+    try:
+        assert not peer_disconnected(server)
+        client.sendall(b"x")
+        assert not peer_disconnected(server)
+        assert server.recv(1) == b"x"
+        client.close()
+        assert peer_disconnected(server)
+    finally:
+        server.close()
+        client.close()

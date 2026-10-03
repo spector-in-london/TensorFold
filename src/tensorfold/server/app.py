@@ -27,6 +27,7 @@ import uuid
 
 from tensorfold.engine.lane_engine import LaneEngine, LaneStream, SuffixLookupProposer
 from tensorfold.server.http import (
+    ClientDisconnected,
     RequestError,
     _normalize_tool_call_arguments,
     parse_harmony_output,
@@ -432,6 +433,7 @@ class ChatJob:
     error: BaseException | None = None
     chunks: "queue.Queue[list[int] | None]" = field(default_factory=queue.Queue)
     done: threading.Event = field(default_factory=threading.Event)
+    cancelled: threading.Event = field(default_factory=threading.Event)
 
 
 class _JobQueue(queue.PriorityQueue):
@@ -650,6 +652,10 @@ class Scheduler:
                     job = self._queue.get_nowait()
                 except queue.Empty:
                     return
+            if job.cancelled.is_set():
+                self.completed += 1
+                self._finish(job)
+                continue
             if admitted and self.engine.active_count > 0:
                 self._held = job
                 return
@@ -686,6 +692,10 @@ class Scheduler:
             print(f"[tensorfold] snapshot read failed: {type(exc).__name__}: {exc}", flush=True)
 
     def _start_job(self, job: ChatJob) -> None:
+        if job.cancelled.is_set():
+            self.completed += 1
+            self._finish(job)
+            return
         job.started_at = time.perf_counter()
         self.starts += 1
         self._starting = job
@@ -781,6 +791,7 @@ class ChatApp:
     """One model behind the OpenAI endpoint (``server.http.make_handler``)."""
 
     accepts_sampling = True
+    accepts_disconnect = True
     # the request's tool list never stops prose from streaming
     streams_prose_with_tools = True
 
@@ -958,6 +969,7 @@ class ChatApp:
         on_delta: Any | None = None,
         tools: list[dict[str, Any]] | None = None,
         sampling: dict[str, Any] | None = None,
+        disconnected: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         _REQUEST.sampling = sampling   # per HTTP thread
         received_at = time.perf_counter()
@@ -968,7 +980,7 @@ class ChatApp:
         try:
             return self._chat_prepared(messages, max_tokens=limit, temperature=temperature, on_delta=on_delta,
                                        tools=tools, received_at=received_at, background=background,
-                                       preparing=preparing)
+                                       preparing=preparing, disconnected=disconnected)
         finally:
             if preparing is not None:
                 preparing.release()
@@ -999,6 +1011,7 @@ class ChatApp:
         received_at: float,
         background: bool,
         preparing: "ChatApp._Preparing | None",
+        disconnected: Callable[[], bool] | None,
     ) -> dict[str, Any]:
         # a request's chat_template_kwargs.enable_thinking (via the sampling fields) overrides the server's
         fields = getattr(_REQUEST, "sampling", None) or {}
@@ -1051,6 +1064,18 @@ class ChatApp:
             return job
 
         job = make_job()
+
+        def abandon() -> None:
+            job.cancelled.set()
+            self.scheduler.finish_job(job, reason="client_disconnected")
+
+        def send_delta(delta: str | dict[str, Any]) -> None:
+            try:
+                on_delta(delta)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                abandon()
+                raise
+
         if background:
             # the session's first turn is usually a few ms behind: let it arrive and render first
             deadline = received_at + self.background_grace_s
@@ -1073,7 +1098,18 @@ class ChatApp:
         replay: list[int] = []        # tokens a preempted job already delivered, owed again by its rerun
         preemptions = 0
         while True:
-            chunk = job.chunks.get()
+            if disconnected is None:
+                chunk = job.chunks.get()
+            else:
+                while True:
+                    if disconnected():
+                        abandon()
+                        raise ClientDisconnected("client closed the connection")
+                    try:
+                        chunk = job.chunks.get(timeout=0.25)
+                        break
+                    except queue.Empty:
+                        continue
             if chunk is None:
                 if job.preempted and job.error is None:
                     # a user's request took the engine: run again from the start (same prompt and sampling, so the
@@ -1114,16 +1150,16 @@ class ChatApp:
                 piece = reasoning_so_far[len(streamed_reasoning):]
                 if piece:
                     streamed_reasoning = reasoning_so_far
-                    on_delta({"reasoning_content": piece})
+                    send_delta({"reasoning_content": piece})
             shown = hide_tool_calls(answer, finished=False) if calls_stream is not None else answer
             visible = streaming_visible_text(shown)
             delta = visible[len(streamed):]
             if delta:
                 streamed = visible
-                on_delta(delta)
+                send_delta(delta)
             if calls_stream is not None:
                 for call_delta in calls_stream.feed(answer):   # never the reasoning: a call it mentions is not made
-                    on_delta(call_delta)
+                    send_delta(call_delta)
         if job.error is not None:
             raise job.error
 
