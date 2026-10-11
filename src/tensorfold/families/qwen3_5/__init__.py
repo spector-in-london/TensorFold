@@ -234,12 +234,28 @@ def install_mlx_lanes(model: Any) -> tuple[int, int]:
     return exact, exact
 
 
+def _materialize_rope_frequencies(model: Any) -> None:
+    """Finish private RoPE arrays on the loading thread before the scheduler uses them.
+
+    MLX-LM's scaled RoPE modules keep lazy frequency arrays in ``_freqs``, outside
+    ``model.parameters()``. Evaluating the weights does not evaluate those arrays;
+    carrying their unevaluated graphs into the scheduler can reference a stream
+    that does not exist in that thread.
+    """
+
+    import mlx.core as mx
+
+    frequencies = [getattr(module, "_freqs", None) for _, module in model.named_modules()]
+    mx.eval([freqs for freqs in frequencies if isinstance(freqs, mx.array)])
+
+
 def load(model_dir: Path, *, lane_kernels: str = "auto", **_: Any) -> tuple[Any, Any]:
     """The model with lane kernels installed when ``lane_kernels`` is "on", or "auto" on a GPU with tensor units."""
 
     from tensorfold.families import quantization, read_config
 
     model, tokenizer = load_lane_model(Path(model_dir))
+    _materialize_rope_frequencies(model)
     fits = quantization(read_config(model_dir)) == (4, 64)
     use = fits and (lane_kernels == "on" or (lane_kernels == "auto" and tensor_units()))
     model._tensorfold_lanes = bool(use)
